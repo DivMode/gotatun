@@ -1,0 +1,54 @@
+[package]
+name = "gotatun-android-jni"
+description = "JNI bindings exposing GotaTun via the amneziawg-go 7-symbol surface"
+version = "0.1.0"
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# cdylib: produces libam_go.so for Android. Renamed to libam-go.so by the
+# wgtunnel-android Gradle build via jniLibs override (see Phase A docs).
+# rlib: lets us write integration tests that link the same code natively.
+[lib]
+name = "am_go"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# Enable the `device` and `tun` features explicitly. The default-features
+# bundle pulls in aws-lc-rs (hardware crypto on aarch64-android, x86, etc).
+gotatun = { workspace = true, default-features = true, features = ["device", "tun"] }
+
+# Direct deps for the parser. Workspace versions inherited from gotatun's
+# Cargo.toml — keeps everything pinned consistently.
+eyre = { workspace = true }
+base64 = { workspace = true }
+# Note: gotatun's UAPI Peer.allowed_ip is `Vec<ipnetwork::IpNetwork>`, not
+# the unrelated `ip_network` crate. Match the type the public API expects.
+ipnetwork = { workspace = true }
+
+# JNI glue. jni 0.21 matches GotaTun's MSRV ecosystem.
+jni = { version = "0.21", default-features = false }
+
+# Tokio runtime for spawning the device's read/write loops. multi_thread
+# flavor lets crypto run on multiple cores when the phone has them.
+tokio = { workspace = true, features = ["rt-multi-thread", "net", "io-util", "sync", "time", "macros"] }
+
+# Slab handle table — integer handles into the tunnel registry.
+slab = "0.4"
+
+# Mutex around the slab so the JNI surface is thread-safe.
+parking_lot = { workspace = true }
+
+# Logging that shows up under `adb logcat`.
+log = { workspace = true }
+
+[target.'cfg(target_os = "android")'.dependencies]
+android_logger = "0.13"
+
+[target.'cfg(not(target_os = "android"))'.dependencies]
+env_logger = "0.10"
+
+[dev-dependencies]
+hex = { workspace = true }

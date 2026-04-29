@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["gotatun", "gotatun-cli"]
+members = ["gotatun", "gotatun-cli", "gotatun-android-jni"]
 
 [workspace.package]
 authors = [
