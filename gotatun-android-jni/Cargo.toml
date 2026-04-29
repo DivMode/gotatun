@@ -27,6 +27,9 @@ base64 = { workspace = true }
 # Note: gotatun's UAPI Peer.allowed_ip is `Vec<ipnetwork::IpNetwork>`, not
 # the unrelated `ip_network` crate. Match the type the public API expects.
 ipnetwork = { workspace = true }
+# tun crate gives us `Configuration::raw_fd(fd)` so we can wrap the
+# Android VpnService-allocated TUN fd. Same version pin as gotatun.
+tun = { workspace = true, default-features = false }
 
 # JNI glue. jni 0.21 matches GotaTun's MSRV ecosystem.
 jni = { version = "0.21", default-features = false }

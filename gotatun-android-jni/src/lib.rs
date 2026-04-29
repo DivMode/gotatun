@@ -20,11 +20,21 @@
 //! JNI surface as we iterate.
 
 pub mod registry;
+pub mod runtime;
+pub mod tun_bridge;
 pub mod uapi_parser;
+pub mod udp_factory;
 
+use std::sync::atomic::Ordering;
+
+use gotatun::device::DeviceBuilder;
+use gotatun::device::uapi::{UapiServer, command::Request};
 use jni::JNIEnv;
 use jni::objects::{JClass, JString};
 use jni::sys::{jint, jstring};
+
+use crate::runtime::{TunnelEntry, runtime, tunnels};
+use crate::udp_factory::FdRecordingUdpFactory;
 
 /// Initialise logging once. The Android target sends logs to logcat
 /// under the `AmneziaWG/Rust` tag (matches the existing Go side's
@@ -95,21 +105,25 @@ pub extern "system" fn Java_org_amnezia_awg_GoBackend_awgVersion(
     }
 }
 
-/// Bring up a tunnel. See module docs for full semantics.
+/// Bring up a tunnel.
 ///
-/// Phase A skeleton — currently parses the config and returns -1 (until
-/// the device-spawn path is wired up in task #7's follow-up).
+/// Mirrors `amneziawg-go`'s `awgTurnOn`: parse settings, wrap the raw
+/// TUN fd, build a GotaTun Device, store the handle.
+///
+/// `iface_name` and `uapi_path` are unused — `iface_name` is purely
+/// informational on the Go side (logging), and `uapi_path` is for
+/// wg-tool's Unix-socket UAPI which we don't expose on Android (the
+/// dispatcher uses Android broadcasts, not wg-tool).
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_org_amnezia_awg_GoBackend_awgTurnOn(
     mut env: JNIEnv,
     _class: JClass,
-    iface_name: JString,
+    _iface_name: JString,
     tun_fd: jint,
     settings: JString,
-    uapi_path: JString,
+    _uapi_path: JString,
 ) -> jint {
     init_logging();
-    let _ = (&iface_name, tun_fd, &uapi_path); // silence unused-warnings pre-impl
 
     let settings_str: String = match env.get_string(&settings) {
         Ok(s) => s.into(),
@@ -128,22 +142,79 @@ pub extern "system" fn Java_org_amnezia_awg_GoBackend_awgTurnOn(
     };
 
     log::info!(
-        "awgTurnOn: parsed {} peer(s), {} address(es), mtu={:?}",
+        "awgTurnOn: bringing up tunnel with {} peer(s) on tun fd {}",
         parsed.set.peers.len(),
-        parsed.interface_addresses.len(),
-        parsed.interface_mtu,
+        tun_fd,
     );
 
-    // TODO(phase-a/task-7): build the GotaTun Device from `parsed.set` +
-    // raw `tun_fd`, spawn its tasks on the shared Tokio runtime, store
-    // the handle in `REGISTRY`, return the integer handle. Until then
-    // we return -1 so the Kotlin layer surfaces a clean error rather
-    // than silently believing the tunnel is up.
-    -1
+    // Build the TUN bridge. On error the fd is closed by the tun crate's
+    // Drop impl, matching amneziawg-go's "we own the fd from this point"
+    // contract.
+    let tun = match tun_bridge::tun_from_fd(tun_fd) {
+        Ok(t) => t,
+        Err(e) => {
+            log::error!("awgTurnOn: tun bridge failed: {e:#}");
+            return -1;
+        }
+    };
+
+    // UAPI client for in-process Get/Set requests. Java side never talks
+    // to a Unix socket — it goes through awgGetConfig / awgUpdateTunnelPeers,
+    // which call into the client we keep in the registry.
+    let (uapi_client, uapi_server) = UapiServer::new();
+
+    // Custom UDP factory that records the bound socket fds so the Java
+    // side's VpnService.protect() callsite (awgGetSocketV4 / V6) can
+    // exempt the WG underlay from the VPN itself. This must be set on
+    // DeviceBuilder via `with_udp(...)` instead of `with_default_udp()`.
+    let udp_factory = FdRecordingUdpFactory::new();
+    let (fd_v4_handle, fd_v6_handle) = udp_factory.handles();
+
+    // Build + start the device on the shared Tokio runtime. block_on is
+    // safe here because we're in a JNI call from the Java side; the JVM
+    // worker thread is parked anyway.
+    let device_result = runtime().block_on(async {
+        let device = DeviceBuilder::new()
+            .with_uapi(uapi_server)
+            .with_udp(udp_factory)
+            .with_ip(tun)
+            .build()
+            .await?;
+        // Apply the parsed Set config. This installs the private key,
+        // listen port, and peers.
+        uapi_client.send_sync(Request::Set(parsed.set))?;
+        Ok::<_, eyre::Report>(device)
+    });
+
+    let device = match device_result {
+        Ok(d) => d,
+        Err(e) => {
+            log::error!("awgTurnOn: device build/configure failed: {e:#}");
+            return -1;
+        }
+    };
+
+    let entry = TunnelEntry {
+        device: Box::new(device),
+        uapi: uapi_client,
+        udp_fd_v4: fd_v4_handle,
+        udp_fd_v6: fd_v6_handle,
+    };
+
+    match tunnels().insert(entry) {
+        Some(handle) => {
+            log::info!("awgTurnOn: tunnel up, handle={handle}");
+            handle
+        }
+        None => {
+            log::error!("awgTurnOn: registry full — i32 handle space exhausted");
+            -1
+        }
+    }
 }
 
 /// Tear down a tunnel by handle. Idempotent — Java may call this on a
-/// handle that's already gone.
+/// handle that's already gone (and amneziawg-go silently ignores it).
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_org_amnezia_awg_GoBackend_awgTurnOff(
     _env: JNIEnv,
@@ -151,12 +222,23 @@ pub extern "system" fn Java_org_amnezia_awg_GoBackend_awgTurnOff(
     handle: jint,
 ) {
     init_logging();
-    log::info!("awgTurnOff: handle={handle} (skeleton, registry not yet wired)");
-    // TODO(phase-a/task-7): REGISTRY.remove(handle) and drop the device.
+    let Some(entry) = tunnels().remove(handle) else {
+        log::info!("awgTurnOff: handle={handle} not in registry (already torn down)");
+        return;
+    };
+
+    // Drop the UAPI client first so any pending in-flight requests
+    // unblock with a "device gone" error rather than hanging on the
+    // device's response channel.
+    drop(entry.uapi);
+
+    entry.device.stop_blocking();
+
+    log::info!("awgTurnOff: handle={handle} torn down");
 }
 
 /// Returns the IPv4 UDP socket fd for VpnService.protect(). -1 if the
-/// handle is unknown or no IPv4 socket exists.
+/// handle is unknown or the socket isn't bound yet.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_org_amnezia_awg_GoBackend_awgGetSocketV4(
     _env: JNIEnv,
@@ -164,9 +246,9 @@ pub extern "system" fn Java_org_amnezia_awg_GoBackend_awgGetSocketV4(
     handle: jint,
 ) -> jint {
     init_logging();
-    log::debug!("awgGetSocketV4: handle={handle} (skeleton)");
-    // TODO(phase-a/task-8): expose GotaTun's bound UDP socket fd.
-    -1
+    tunnels()
+        .with(handle, |entry| entry.udp_fd_v4.load(Ordering::Acquire))
+        .unwrap_or(-1)
 }
 
 /// Returns the IPv6 UDP socket fd. Same contract as V4.
@@ -177,11 +259,17 @@ pub extern "system" fn Java_org_amnezia_awg_GoBackend_awgGetSocketV6(
     handle: jint,
 ) -> jint {
     init_logging();
-    log::debug!("awgGetSocketV6: handle={handle} (skeleton)");
-    -1
+    tunnels()
+        .with(handle, |entry| entry.udp_fd_v6.load(Ordering::Acquire))
+        .unwrap_or(-1)
 }
 
-/// Dump the current device configuration in UAPI format.
+/// Dump the current device configuration in UAPI text format.
+///
+/// The Kotlin caller (`org.amnezia.awg.GoBackend.getTunnelConfig`)
+/// parses this string with `awg.config.Config.parse(...)` to extract
+/// peer state for UI display. We rely on GotaTun's `GetResponse: Display`
+/// impl which produces compliant UAPI lines.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_org_amnezia_awg_GoBackend_awgGetConfig(
     env: JNIEnv,
@@ -189,16 +277,46 @@ pub extern "system" fn Java_org_amnezia_awg_GoBackend_awgGetConfig(
     handle: jint,
 ) -> jstring {
     init_logging();
-    log::debug!("awgGetConfig: handle={handle} (skeleton)");
-    // TODO(phase-a/task-9): UapiClient::send_sync(Get) and serialize.
-    match env.new_string("") {
+    use gotatun::device::uapi::command::{Get, Response};
+
+    let result = tunnels().with(handle, |entry| {
+        // `Get` is #[non_exhaustive], so use Default rather than struct literal.
+        entry.uapi.send_sync(Request::Get(Get::default()))
+    });
+
+    let config_str = match result {
+        Some(Ok(Response::Get(get))) => get.to_string(),
+        Some(Ok(Response::Set(_))) => {
+            log::error!("awgGetConfig: unexpected Set response from Get request");
+            String::new()
+        }
+        Some(Err(e)) => {
+            log::error!("awgGetConfig: UAPI Get failed: {e:#}");
+            String::new()
+        }
+        None => {
+            log::debug!("awgGetConfig: handle={handle} not in registry");
+            String::new()
+        }
+    };
+
+    match env.new_string(config_str) {
         Ok(s) => s.into_raw(),
-        Err(_) => std::ptr::null_mut(),
+        Err(e) => {
+            log::error!("awgGetConfig: failed to allocate JString: {e}");
+            std::ptr::null_mut()
+        }
     }
 }
 
 /// Atomically replace the peer list on an active tunnel. Returns 0 on
 /// success, -1 on failure.
+///
+/// The amneziawg-go behavior is "build a peer-only Set request and call
+/// IpcSet" — preserves the existing private key + listen port, replaces
+/// the peer table. We mirror that contract: parse the new settings, take
+/// the `peers` list (and `replace_peers` flag), drop the interface-level
+/// fields.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_org_amnezia_awg_GoBackend_awgUpdateTunnelPeers(
     mut env: JNIEnv,
@@ -215,7 +333,7 @@ pub extern "system" fn Java_org_amnezia_awg_GoBackend_awgUpdateTunnelPeers(
         }
     };
 
-    let _parsed = match uapi_parser::parse(&settings_str) {
+    let parsed = match uapi_parser::parse(&settings_str) {
         Ok(p) => p,
         Err(e) => {
             log::error!("awgUpdateTunnelPeers: parse failed: {e:#}");
@@ -223,9 +341,32 @@ pub extern "system" fn Java_org_amnezia_awg_GoBackend_awgUpdateTunnelPeers(
         }
     };
 
-    log::info!("awgUpdateTunnelPeers: handle={handle} (skeleton, parser OK)");
-    // TODO(phase-a/task-9): REGISTRY.with_mut(handle, |dev| dev.uapi_client.send_sync(parsed.set))
-    -1
+    // Strip interface-level fields — they're already set on the existing
+    // device. Keep peers + replace_peers semantics. The parsed.set
+    // already has replace_peers=true (set by parse() unconditionally).
+    let mut peers_only = gotatun::device::uapi::command::Set::builder()
+        .replace_peers()
+        .build();
+    peers_only.peers = parsed.set.peers;
+
+    let result = tunnels().with(handle, |entry| {
+        entry.uapi.send_sync(Request::Set(peers_only))
+    });
+
+    match result {
+        Some(Ok(_)) => {
+            log::info!("awgUpdateTunnelPeers: handle={handle} updated");
+            0
+        }
+        Some(Err(e)) => {
+            log::error!("awgUpdateTunnelPeers: UAPI Set failed: {e:#}");
+            -1
+        }
+        None => {
+            log::error!("awgUpdateTunnelPeers: handle={handle} not in registry");
+            -1
+        }
+    }
 }
 
 #[cfg(test)]
