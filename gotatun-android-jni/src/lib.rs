@@ -148,17 +148,6 @@ pub extern "system" fn Java_org_amnezia_awg_GoBackend_awgTurnOn(
         tun_fd,
     );
 
-    // Build the TUN bridge. On error the fd is closed by the tun crate's
-    // Drop impl, matching amneziawg-go's "we own the fd from this point"
-    // contract.
-    let tun = match tun_bridge::tun_from_fd(tun_fd) {
-        Ok(t) => t,
-        Err(e) => {
-            log::error!("awgTurnOn: tun bridge failed: {e:#}");
-            return -1;
-        }
-    };
-
     // UAPI client for in-process Get/Set requests. Java side never talks
     // to a Unix socket — it goes through awgGetConfig / awgUpdateTunnelPeers,
     // which call into the client we keep in the registry.
@@ -171,10 +160,14 @@ pub extern "system" fn Java_org_amnezia_awg_GoBackend_awgTurnOn(
     let udp_factory = FdRecordingUdpFactory::new();
     let (fd_v4_handle, fd_v6_handle) = udp_factory.handles();
 
-    // Build + start the device on the shared Tokio runtime. block_on is
-    // safe here because we're in a JNI call from the Java side; the JVM
-    // worker thread is parked anyway.
+    // Build + start the device on the shared Tokio runtime. The TUN
+    // bridge MUST be constructed inside the runtime context — tun's
+    // AsyncDevice wraps tokio::AsyncFd which calls Handle::current(),
+    // panicking with "there is no reactor running" if called from a
+    // synchronous JNI context. block_on with a runtime guard is what
+    // makes this safe.
     let device_result = runtime().block_on(async {
+        let tun = tun_bridge::tun_from_fd(tun_fd)?;
         let device = DeviceBuilder::new()
             .with_uapi(uapi_server)
             .with_udp(udp_factory)
