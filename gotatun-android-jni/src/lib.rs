@@ -174,9 +174,11 @@ pub extern "system" fn Java_org_amnezia_awg_GoBackend_awgTurnOn(
             .with_ip(tun)
             .build()
             .await?;
-        // Apply the parsed Set config. This installs the private key,
-        // listen port, and peers.
-        uapi_client.send_sync(Request::Set(parsed.set))?;
+        // Apply the parsed Set config. Must use the async send().await,
+        // not send_sync — the latter calls tokio's blocking_send /
+        // blocking_recv which panic when invoked from inside an async
+        // runtime context (we're inside block_on here).
+        uapi_client.send(Request::Set(parsed.set)).await?;
         Ok::<_, eyre::Report>(device)
     });
 
