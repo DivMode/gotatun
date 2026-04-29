@@ -19,6 +19,7 @@
 //! Modules below are tested in isolation and ready to be wired into the
 //! JNI surface as we iterate.
 
+pub mod proxy_stubs;
 pub mod registry;
 pub mod runtime;
 pub mod tun_bridge;
