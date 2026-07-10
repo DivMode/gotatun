@@ -282,7 +282,7 @@ fn parse_ipnetwork(value: &str) -> Result<IpNetwork> {
 mod tests {
     use super::*;
 
-    /// Phone1's actual production config from the catchseo Ansible
+    /// Phone1's actual production config from the oeili Ansible
     /// template. If parsing this regresses, slice 1 deployments break.
     const PHONE1_CONFIG: &str = "\
 # WireGuard config for phone1 (PRD #1595, slice 1).

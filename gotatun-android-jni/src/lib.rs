@@ -62,7 +62,7 @@ fn init_logging() {
 
 /// Build-time version string returned by `awgVersion`.
 ///
-/// Format: `<gotatun-version>+catchseo-jni-<crate-version>`. The catchseo
+/// Format: `<gotatun-version>+oeili-jni-<crate-version>`. The oeili
 /// suffix lets us bump the shim independently of GotaTun upstream so we
 /// can correlate phone-side reports to a specific JNI build.
 ///
@@ -71,7 +71,7 @@ fn init_logging() {
 /// scaffolding build.
 fn version_string() -> String {
     format!(
-        "gotatun-{}+catchseo-jni-{}",
+        "gotatun-{}+oeili-jni-{}",
         option_env!("GOTATUN_VERSION").unwrap_or("dev"),
         env!("CARGO_PKG_VERSION"),
     )
@@ -372,9 +372,9 @@ mod tests {
     #[test]
     fn version_string_includes_both_components() {
         let v = version_string();
-        // Sanity: format keeps the "gotatun-" prefix and "+catchseo-jni-"
+        // Sanity: format keeps the "gotatun-" prefix and "+oeili-jni-"
         // separator so dashboards/log greps can split reliably.
         assert!(v.starts_with("gotatun-"), "version: {v}");
-        assert!(v.contains("+catchseo-jni-"), "version: {v}");
+        assert!(v.contains("+oeili-jni-"), "version: {v}");
     }
 }
